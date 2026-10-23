@@ -12,3 +12,11 @@
 - 기간·행 수·열 수: 105행 · 8열
 - 사용한 열: Type,	pH,	Adsorbent Dose (g/L),Concentration (mg/L),	Temperature	Time (min)
 - 개인 단위 정보 없음 확인: 예
+
+ ## 20218이유리
+    - 오늘 결정한 것: 데이터에서 동일 조건에서 실험했지만 결과값의 차이가 큰 데이터들을 삭제했다.
+    - AI에게 보낸 프롬프트(원문): [https://raw.githubusercontent.com/dg2025519-create/suhangpyeongga/refs/heads/main/DataSet.csv](https://raw.githubusercontent.com/dg2025519-create/suhangpyeongga/refs/heads/main/DataSet.csv) 
+이 데이터에서 변수별 removal과의 상관관계가 강한 변수를 알려주고 제거해야할 이상치가 있으면 말해주고 그 이유를 설명해줘. 몇번째 행?
+    - AI가 준 것 중 고치거나 버린 것과 그 이유:  
+    - 느낀 점: 
+    - AI 없이 내가 스스로 한 것: 직접 제거할 값들을 삭제했다.
