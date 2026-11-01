@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from itertools import combinations
 from sklearn.model_selection import train_test_split, KFold, cross_val_predict
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -57,7 +58,8 @@ def explain(text):
 
 
 st.sidebar.title("📌 메뉴")
-page = st.sidebar.radio("페이지 선택", ["1. 데이터 보기", "2. 상관관계 분석", "3. 예측 모델", "4. 결론 및 직접 예측"])
+page = st.sidebar.radio("페이지 선택", ["1. 데이터 보기", "2. 상관관계 분석", "3. 예측 모델",
+                                        "4. 결론 및 직접 예측", "5. 최적 변수 조합 탐색"])
 st.title("🧪 실험조건으로 흡착률(Removal)을 예측할 수 있을까?")
 
 # ================= 1. 데이터 =================
@@ -80,7 +82,8 @@ if page == "1. 데이터 보기":
     st.dataframe(df.groupby("Type")[TARGET].agg(["mean", "std", "count"]), use_container_width=True)
 
     st.info("ℹ️ `Max Adsorp Capacity`는 Removal·농도·흡착제 양으로 계산되는 값이라 "
-            "상관관계 분석과 예측 모델에서 제외했습니다(데이터 누수 방지).")
+            "상관관계 분석과 예측 모델에서 제외했습니다(데이터 누수 방지). "
+            "`Concentration`은 오염물질의 초기 농도(mg/L)입니다.")
 
 # ================= 2. 상관관계 =================
 elif page == "2. 상관관계 분석":
@@ -151,7 +154,7 @@ elif page == "2. 상관관계 분석":
         hint = {
             "pH": "pH가 산성(3)에서 중성~염기성으로 갈수록 Removal이 높아지는지 확인하세요. 표면 전하와 오염물질 상태가 바뀌기 때문입니다.",
             "Adsorbent Dose (g/L)": "흡착제를 늘리면 흡착 자리가 늘어 Removal이 오르지만, 어느 양부터는 증가폭이 작아지는(수확 체감) 모양이 나타납니다.",
-            "Concentration (mg/L)": "농도가 높아질수록 흡착제의 자리가 포화되어 Removal(%)이 떨어지는 것이 일반적입니다.",
+            "Concentration (mg/L)": "오염물질 농도가 높아질수록 흡착제의 자리가 포화되어 Removal(%)이 떨어지는 것이 일반적입니다.",
             "Temperature": "온도가 오를 때 Removal이 오르면 흡열 과정(온도가 높을수록 유리)임을 시사합니다.",
             "Time (min)": "초반에 빠르게 오르다 일정 시간 이후 평평해지면 흡착 평형에 도달했다는 뜻입니다.",
         }[var]
@@ -298,7 +301,7 @@ elif page == "3. 예측 모델":
             f"- 중요도는 선택한 테스트 비율에 따라 바뀔 수 있으므로 순위의 큰 흐름만 참고하세요.")
 
 # ================= 4. 결론 =================
-else:
+elif page == "4. 결론 및 직접 예측":
     st.header("🎯 결론 및 직접 예측")
     kf = KFold(5, shuffle=True, random_state=42)
     model = RandomForestRegressor(n_estimators=300, random_state=42)
@@ -340,3 +343,108 @@ else:
             f"**{pred:.1f}%**이고, 교차검증 평균 오차({mae:.1f}%p)를 감안하면 대략 {max(pred-mae,0):.1f}~{min(pred+mae,100):.1f}% 범위로 볼 수 있습니다.\n\n"
             "랜덤포레스트는 학습 데이터 범위 밖을 외삽하지 못하고, 실험에서 측정하지 않은 조합(예: pH 10 + 농도 500)은 "
             "가까운 다른 조건의 값으로 추정하므로 신뢰도가 낮습니다.")
+
+# ================= 5. 최적 변수 조합 탐색 =================
+else:
+    st.header("🔎 최적 변수 조합 탐색")
+    st.markdown("실험조건 5개 중 **1~5개를 고르는 모든 조합(31개)** 으로 모델을 학습해, R²가 가장 높은 조합을 찾습니다.")
+
+    c1, c2, c3 = st.columns(3)
+    model_name = c1.selectbox("모델", ["랜덤포레스트", "그래디언트부스팅", "선형회귀"])
+    use_type = c2.checkbox("Type(흡착제 종류) 항상 포함", value=True)
+    metric_name = c3.radio("정렬 기준", ["R² (5-fold CV)", "R² (Type 제외 검증)"])
+
+    SHORT = {"pH": "pH", "Adsorbent Dose (g/L)": "Dose", "Concentration (mg/L)": "Conc",
+             "Temperature": "Temp", "Time (min)": "Time"}
+    type_cols = [c for c in X_all.columns if c.startswith("Type_")]
+
+    def make_model(name):
+        if name == "랜덤포레스트":
+            return RandomForestRegressor(n_estimators=100, random_state=42)
+        if name == "그래디언트부스팅":
+            return GradientBoostingRegressor(random_state=42)
+        return LinearRegression()
+
+    @st.cache_data(show_spinner=False)
+    def search(model_name, use_type):
+        kf = KFold(5, shuffle=True, random_state=42)
+        rows = []
+        for k in range(1, len(NUM_FEATURES) + 1):
+            for combo in combinations(NUM_FEATURES, k):
+                cols = list(combo) + (type_cols if use_type else [])
+                X = X_all[cols]
+                cvp = cross_val_predict(make_model(model_name), X, y_all, cv=kf)
+                lo = pd.Series(index=df.index, dtype=float)
+                for t in df["Type"].unique():
+                    idx = df["Type"] == t
+                    m = make_model(model_name).fit(X[~idx], y_all[~idx])
+                    lo[idx] = m.predict(X[idx])
+                rows.append({
+                    "변수 조합": " + ".join(SHORT[c] for c in combo),
+                    "변수 수": k,
+                    "R² (5-fold CV)": r2_score(y_all, cvp),
+                    "R² (Type 제외 검증)": r2_score(y_all, lo),
+                    "MAE (CV)": mean_absolute_error(y_all, cvp),
+                })
+        return pd.DataFrame(rows)
+
+    if st.button("🚀 탐색 시작", type="primary"):
+        with st.spinner("31개 조합을 학습하는 중입니다..."):
+            st.session_state["search_res"] = search(model_name, use_type)
+            st.session_state["search_key"] = (model_name, use_type)
+
+    if "search_res" not in st.session_state:
+        st.info("위에서 옵션을 고르고 '탐색 시작'을 눌러주세요. 랜덤포레스트는 수십 초 걸릴 수 있습니다.")
+        st.stop()
+
+    if st.session_state["search_key"] != (model_name, use_type):
+        st.warning("옵션이 바뀌었습니다. 아래는 이전 옵션의 결과이니 다시 '탐색 시작'을 눌러주세요.")
+
+    res = st.session_state["search_res"].sort_values(metric_name, ascending=False).reset_index(drop=True)
+    res.index = res.index + 1
+
+    best = res.iloc[0]
+    st.success(f"🏆 {metric_name} 기준 최고 조합: **{best['변수 조합']}** "
+               f"(변수 {int(best['변수 수'])}개, R² = {best[metric_name]:.3f}, MAE = {best['MAE (CV)']:.2f}%p)")
+
+    st.subheader("조합별 성능 순위")
+    st.dataframe(res.style.format({"R² (5-fold CV)": "{:.3f}", "R² (Type 제외 검증)": "{:.3f}", "MAE (CV)": "{:.2f}"}),
+                 use_container_width=True, height=450)
+
+    top = res.head(15).iloc[::-1]
+    fig = px.bar(top, x=metric_name, y="변수 조합", orientation="h", color="변수 수",
+                 color_continuous_scale="Viridis")
+    st.plotly_chart(fig, use_container_width=True)
+    second = res.iloc[1]
+    explain(f"상위 15개 조합입니다. 막대가 길수록 예측력이 높고, 색은 변수 개수입니다.\n\n"
+            f"- 1위 **{best['변수 조합']}** ({best[metric_name]:.3f}), 2위 **{second['변수 조합']}** ({second[metric_name]:.3f})\n"
+            f"- 상위권에 공통으로 들어가는 변수가 **예측에 꼭 필요한 변수**입니다.\n"
+            f"- 1위와 하위권의 R² 차이는 {best[metric_name] - res[metric_name].iloc[-1]:.3f}입니다.")
+
+    by_k = res.groupby("변수 수")[metric_name].max().reset_index()
+    fig = px.line(by_k, x="변수 수", y=metric_name, markers=True)
+    fig.update_xaxes(dtick=1)
+    st.plotly_chart(fig, use_container_width=True)
+    simple = res[res[metric_name] >= best[metric_name] - 0.01].sort_values(["변수 수", metric_name], ascending=[True, False]).iloc[0]
+    explain(f"변수 개수별로 달성 가능한 최고 R²입니다. 곡선이 평평해지는 지점부터는 변수를 추가해도 이득이 작습니다.\n\n"
+            f"- 변수 1개 최고 R²: {by_k[metric_name].iloc[0]:.3f} → 5개: {by_k[metric_name].iloc[-1]:.3f}\n"
+            f"- 최고 R²와 차이가 0.01 이내이면서 변수가 가장 적은 조합: **{simple['변수 조합']}** "
+            f"({int(simple['변수 수'])}개, R² = {simple[metric_name]:.3f}) → 실험을 줄이고 싶다면 이 조합이 효율적입니다.")
+
+    contrib = []
+    for full, s in SHORT.items():
+        has = res["변수 조합"].str.split(" \\+ ").apply(lambda l: s in l)
+        contrib.append({"변수": s, "포함 시 평균 R²": res.loc[has, metric_name].mean(),
+                        "미포함 시 평균 R²": res.loc[~has, metric_name].mean()})
+    ct = pd.DataFrame(contrib)
+    ct["차이"] = ct["포함 시 평균 R²"] - ct["미포함 시 평균 R²"]
+    ct = ct.sort_values("차이", ascending=False)
+    st.plotly_chart(px.bar(ct, x="변수", y="차이", color="차이", color_continuous_scale="RdBu",
+                           labels={"차이": "포함 시 − 미포함 시 평균 R²"}), use_container_width=True)
+    explain(f"각 변수가 들어간 조합과 빠진 조합의 평균 R² 차이입니다. 클수록 그 변수가 성능을 끌어올립니다.\n\n"
+            f"- 기여도 1위 **{ct.iloc[0]['변수']}** ({ct.iloc[0]['차이']:+.3f}), "
+            f"꼴찌 **{ct.iloc[-1]['변수']}** ({ct.iloc[-1]['차이']:+.3f})\n"
+            f"- 차이가 0에 가깝거나 음수면 이 데이터에서는 예측에 도움이 되지 않는 변수입니다.")
+
+    st.caption("⚠️ 이 데이터는 한 변수씩 바꾼 실험이라, 변수를 빼면 같은 입력값에 서로 다른 Removal이 대응되어 R²가 크게 떨어질 수 있습니다. "
+               "또 31개 조합 중 최고를 고르는 것이므로 점수가 다소 낙관적입니다. 'Type 제외 검증' 기준 순위도 함께 확인하세요.")
