@@ -52,7 +52,8 @@ def explain(text):
 
 st.sidebar.title("📌 메뉴")
 page = st.sidebar.radio("페이지 선택", ["1. 데이터 보기", "2. 상관관계 분석",
-                                        "3. 최적 변수 조합 탐색", "4. 조합별 모델 비교"])
+                                        "3. 최적 변수 조합 탐색", "4. 조합별 모델 비교",
+                                        "5. 농도 log 변환 모델"])
 st.title("🧪 실험조건으로 흡착률(Removal)을 예측할 수 있을까?")
 
 # ================= 1. 데이터 =================
@@ -293,7 +294,7 @@ elif page == "3. 최적 변수 조합 탐색":
                "또 31개 조합 중 최고를 고르는 것이므로 점수가 다소 낙관적입니다. 'Type 제외 검증' 기준 순위도 함께 확인하세요.")
 
 # ================= 4. 조합별 모델 비교 =================
-else:
+elif page == "4. 조합별 모델 비교":
     st.header("⚖️ 조합별 선형회귀 모델 비교")
     st.markdown("세 가지 입력 변수 조합으로 각각 선형회귀 모델을 만들어 성능을 비교합니다.")
 
@@ -421,3 +422,128 @@ else:
             + ("⚠️ 예측값이 0~100%를 벗어났습니다. 선형회귀가 범위 밖 값을 만들 수 있으니 실제로는 0 또는 100%로 해석하세요."
                if pred < 0 or pred > 100 else
                "선형회귀는 직선 관계를 가정하므로, 실험하지 않은 조합이나 범위 밖 값의 예측은 신뢰도가 낮습니다."))
+
+# ================= 5. 농도 log 변환 모델 =================
+else:
+    st.header("📐 농도 log 변환 모델 (추가 실험)")
+    st.markdown("원래 계획에는 없던 **추가 분석**입니다. 농도(Conc)는 Removal과 곡선 관계라서, "
+                "`log(Conc)`로 바꾸면 선형회귀가 더 잘 맞는지 4페이지의 세 조합으로 비교합니다.")
+
+    COMBOS = {
+        "A: pH+Dose+Conc+Temp": ["pH", "Dose", "Conc", "Temp"],
+        "B: pH+Dose+Conc+Temp+Time": ["pH", "Dose", "Conc", "Temp", "Time"],
+        "C: pH+Dose+Conc": ["pH", "Dose", "Conc"],
+    }
+    use_type = st.checkbox("Type(흡착제 종류) 포함", value=True, key="log_type")
+    extra = type_cols if use_type else []
+
+    # log 변환 데이터 (log1p 아님: 농도는 10 이상이라 자연로그 사용)
+    X_log = X_all.copy()
+    X_log["Concentration (mg/L)"] = np.log(X_log["Concentration (mg/L)"])
+
+    st.subheader("농도 변환 전/후 비교")
+    cc = st.columns(2)
+    d1 = df.assign(구분="원래 농도")
+    cc[0].plotly_chart(px.scatter(df, x="Concentration (mg/L)", y=TARGET, color="Type",
+                                  title="원래 Conc vs Removal"), use_container_width=True)
+    cc[1].plotly_chart(px.scatter(x=X_log["Concentration (mg/L)"], y=y_all, color=df["Type"],
+                                  labels={"x": "log(Conc)", "y": TARGET, "color": "Type"},
+                                  title="log(Conc) vs Removal"), use_container_width=True)
+    r_raw = df["Concentration (mg/L)"].corr(y_all)
+    r_log = X_log["Concentration (mg/L)"].corr(y_all)
+    explain(f"- Removal과의 상관계수: 원래 Conc **{r_raw:.3f}**, log(Conc) **{r_log:.3f}**\n"
+            + ("- log 변환 후 상관의 크기가 커져 관계가 더 직선에 가까워졌습니다.\n" if abs(r_log) > abs(r_raw)
+               else "- log 변환으로 직선성이 좋아지지 않았습니다.\n")
+            + "- 농도가 10~500으로 크게 퍼져 있어 작은 값 구간이 몰려 보이는데, log를 취하면 간격이 고르게 펴집니다.")
+
+    kf = KFold(5, shuffle=True, random_state=42)
+
+    def evaluate(Xdf, cols):
+        X = Xdf[cols]
+        cvp = cross_val_predict(LinearRegression(), X, y_all, cv=kf)
+        lo = pd.Series(index=df.index, dtype=float)
+        for t in df["Type"].unique():
+            idx = df["Type"] == t
+            lo[idx] = LinearRegression().fit(X[~idx], y_all[~idx]).predict(X[idx])
+        m = LinearRegression().fit(X, y_all)
+        return m, cvp, {"R² (학습)": m.score(X, y_all),
+                        "R² (5-fold CV)": r2_score(y_all, cvp),
+                        "R² (Type 제외 검증)": r2_score(y_all, lo),
+                        "MAE (CV)": mean_absolute_error(y_all, cvp),
+                        "RMSE (CV)": np.sqrt(mean_squared_error(y_all, cvp))}
+
+    rows, cvp_log, models_log, cvp_raw = [], {}, {}, {}
+    for name, vars_ in COMBOS.items():
+        cols = [REV[n] for n in vars_] + extra
+        _, cr, sr = evaluate(X_all, cols)
+        ml, cl, sl = evaluate(X_log, cols)
+        cvp_raw[name], cvp_log[name], models_log[name] = cr, cl, ml
+        rows.append({"조합": name, "변환": "원래 Conc", **sr})
+        rows.append({"조합": name, "변환": "log(Conc)", **sl})
+    res = pd.DataFrame(rows)
+
+    st.subheader("성능 비교표")
+    fmt = {c: "{:.3f}" for c in ["R² (학습)", "R² (5-fold CV)", "R² (Type 제외 검증)"]}
+    fmt.update({"MAE (CV)": "{:.2f}", "RMSE (CV)": "{:.2f}"})
+    st.dataframe(res.set_index(["조합", "변환"]).style.format(fmt), use_container_width=True)
+
+    piv = res.pivot(index="조합", columns="변환", values="R² (5-fold CV)")
+    piv["개선폭"] = piv["log(Conc)"] - piv["원래 Conc"]
+    bn = piv["log(Conc)"].idxmax()
+    explain("\n".join(f"- **{n}**: CV R² {r['원래 Conc']:.3f} → {r['log(Conc)']:.3f} ({r['개선폭']:+.3f})"
+                      for n, r in piv.iterrows())
+            + f"\n\n- log 변환 후 가장 좋은 조합은 **{bn}** (CV R² = {piv.loc[bn,'log(Conc)']:.3f})입니다.\n"
+            + ("- 모든 조합에서 log 변환이 성능을 높였습니다." if (piv["개선폭"] > 0).all()
+               else "- 일부 조합에서는 log 변환의 효과가 없거나 오히려 낮아졌습니다."))
+
+    long = res.melt(id_vars=["조합", "변환"], value_vars=["R² (5-fold CV)", "R² (Type 제외 검증)"],
+                    var_name="검증방법", value_name="R²")
+    st.plotly_chart(px.bar(long, x="조합", y="R²", color="변환", barmode="group", facet_col="검증방법"),
+                    use_container_width=True)
+    explain("파란/빨간 막대 쌍의 높이 차이가 log 변환의 효과입니다. "
+            "Type 제외 검증에서도 개선되면 새로운 흡착제에도 통하는 개선입니다.")
+
+    st.subheader(f"실제값 vs 예측값 ({bn}, 5-fold CV)")
+    cc = st.columns(2)
+    for i, (title, p) in enumerate([("원래 Conc", cvp_raw[bn]), ("log(Conc)", cvp_log[bn])]):
+        fig = px.scatter(x=y_all, y=p, color=df["Type"],
+                         labels={"x": "실제 Removal", "y": "예측 Removal", "color": "Type"}, title=title)
+        fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="y=x",
+                                 line=dict(dash="dash", color="red")))
+        cc[i].plotly_chart(fig, use_container_width=True)
+    e_raw, e_log = np.abs(y_all - cvp_raw[bn]), np.abs(y_all - cvp_log[bn])
+    explain(f"- 평균 오차: 원래 Conc **{e_raw.mean():.2f}%p**, log(Conc) **{e_log.mean():.2f}%p**\n"
+            f"- 100%를 넘는 예측 수: 원래 {int((cvp_raw[bn] > 100).sum())}개, log {int((cvp_log[bn] > 100).sum())}개\n"
+            "- 점이 점선에 더 가깝게 모이면 log 변환이 곡선 관계를 잘 반영한 것입니다.")
+
+    st.subheader("원 단위 회귀식 (log 변환, 최고 조합)")
+    bm = models_log[bn]
+    bcols = [REV[n] for n in COMBOS[bn]] + extra
+    names = [("log(Conc)" if c == "Concentration (mg/L)" else SHORT.get(c, c)) for c in bcols]
+    eq = pd.DataFrame({"변수": names + ["절편"], "계수": list(bm.coef_) + [bm.intercept_]})
+    st.dataframe(eq.style.format({"계수": "{:.4f}"}), use_container_width=True, hide_index=True)
+    ck = eq.loc[eq["변수"] == "log(Conc)", "계수"].iloc[0]
+    explain(f"log(Conc) 계수는 **{ck:.2f}**입니다. 농도가 2배가 되면 log 값이 약 0.69 늘어 "
+            f"Removal이 약 **{ck*np.log(2):+.1f}%p** 변한다는 뜻입니다(다른 변수 고정).")
+
+    st.subheader("직접 예측해 보기 (log 모델)")
+    pc = st.columns(2)
+    pname = pc[0].selectbox("사용할 조합", list(COMBOS), key="log_pick")
+    typ = pc[1].selectbox("Type", sorted(df["Type"].unique()), disabled=not use_type, key="log_typ")
+    ranges = {"pH": (3.0, 10.0, 5.0, 0.5), "Dose": (0.4, 6.0, 2.0, 0.1), "Conc": (10, 500, 100, 10),
+              "Temp": (25, 55, 25, 5), "Time": (30, 600, 300, 30)}
+    vars_ = COMBOS[pname]
+    sc = st.columns(len(vars_))
+    row = {}
+    for i, n in enumerate(vars_):
+        a, b, d, s_ = ranges[n]
+        row[REV[n]] = sc[i].slider(n, a, b, d, s_, key=f"log_{n}")
+    row["Concentration (mg/L)"] = np.log(row["Concentration (mg/L)"])
+    for c in extra:
+        row[c] = int(c == f"Type_{typ}")
+    pcols = [REV[n] for n in vars_] + extra
+    pred = models_log[pname].predict(pd.DataFrame([row])[pcols])[0]
+    st.metric(f"예측 Removal ({pname}, log 모델)", f"{pred:.1f}%")
+    explain("농도는 입력값을 자동으로 log 변환해서 계산합니다. "
+            + ("⚠️ 예측값이 0~100%를 벗어났으니 실제로는 0 또는 100%로 해석하세요." if pred < 0 or pred > 100
+               else "학습 범위 안의 조건에서만 신뢰할 수 있습니다."))
