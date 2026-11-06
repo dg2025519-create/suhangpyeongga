@@ -6,7 +6,13 @@ import plotly.graph_objects as go
 from itertools import combinations
 from sklearn.model_selection import KFold, cross_val_predict
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.dummy import DummyRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import (r2_score, mean_absolute_error, mean_squared_error,
+                             accuracy_score, recall_score, precision_score,
+                             f1_score, confusion_matrix)
 
 st.set_page_config(page_title="흡착률 예측 분석", layout="wide")
 
@@ -52,7 +58,7 @@ def explain(text):
 
 st.sidebar.title("📌 메뉴")
 page = st.sidebar.radio("페이지 선택", ["1. 데이터 보기", "2. 상관관계 분석",
-                                        "3. 최적 변수 조합 탐색", "4. 조합별 모델 비교"])
+                                        "3. 최적 변수 조합 탐색", "4. 조합·모델 비교"])
 st.title("🧪 실험조건으로 흡착률(Removal)을 예측할 수 있을까?")
 
 # ================= 1. 데이터 =================
@@ -292,132 +298,157 @@ elif page == "3. 최적 변수 조합 탐색":
     st.caption("⚠️ 이 데이터는 한 변수씩 바꾼 실험이라, 변수를 빼면 같은 입력값에 서로 다른 Removal이 대응되어 R²가 크게 떨어질 수 있습니다. "
                "또 31개 조합 중 최고를 고르는 것이므로 점수가 다소 낙관적입니다. 'Type 제외 검증' 기준 순위도 함께 확인하세요.")
 
-# ================= 4. 조합별 모델 비교 =================
+# ================= 4. 조합·모델 비교 =================
 else:
-    st.header("⚖️ 조합별 선형회귀 모델 비교")
-    st.markdown("세 가지 입력 변수 조합으로 각각 선형회귀 모델을 만들어 성능을 비교합니다.")
+    st.header("⚖️ 조합 × 모델 비교 (베이스라인 포함)")
+    st.markdown("세 가지 변수 조합(A/B/C)을 **베이스라인, 선형회귀, 다항회귀, 랜덤포레스트, 그래디언트부스팅**으로 비교합니다.")
+
+    with st.expander("📌 베이스라인이란? 왜 필요한가?", expanded=False):
+        st.markdown(
+            "**베이스라인 = 변수를 전혀 쓰지 않고 학습 데이터의 평균 Removal만 내놓는 모델**입니다.\n\n"
+            "- 점수의 **기준점**: 베이스라인보다 못한 모델은 쓸모가 없습니다.\n"
+            "- **착시 방지**: 고제거 실험이 많으면 무조건 '고제거'라고 찍어도 정확도가 높게 나옵니다.\n"
+            "- '실험조건으로 예측 가능한가?'의 직접 근거: 변수를 쓴 모델이 평균 찍기보다 오차를 얼마나 줄였는지가 답입니다."
+        )
+    with st.expander("📌 정확도·재현율은 어떻게 계산하나?", expanded=False):
+        st.markdown(
+            "Removal은 연속값이라, **기준값 이상이면 '고제거', 미만이면 '저제거'** 로 나눠 분류 지표를 계산합니다. "
+            "실제값과 모델의 예측값을 같은 기준으로 나눈 뒤 비교합니다.\n\n"
+            "- **정확도** = 맞게 구분한 수 / 전체\n"
+            "- **재현율** = 실제 고제거 중 고제거로 예측한 비율 (고제거를 놓치지 않는 정도)\n"
+            "- **정밀도** = 고제거로 예측한 것 중 실제 고제거 비율, **F1** = 정밀도와 재현율의 조화평균"
+        )
 
     COMBOS = {
         "A: pH+Dose+Conc+Temp": ["pH", "Dose", "Conc", "Temp"],
         "B: pH+Dose+Conc+Temp+Time": ["pH", "Dose", "Conc", "Temp", "Time"],
         "C: pH+Dose+Conc": ["pH", "Dose", "Conc"],
     }
-    use_type = st.checkbox("Type(흡착제 종류) 포함", value=True)
+    MODEL_NAMES = ["베이스라인(평균)", "선형회귀", "다항회귀(2차)", "랜덤포레스트", "그래디언트부스팅"]
+
+    def make_model(name):
+        if name == "베이스라인(평균)":
+            return DummyRegressor(strategy="mean")
+        if name == "선형회귀":
+            return LinearRegression()
+        if name == "다항회귀(2차)":
+            return make_pipeline(PolynomialFeatures(2, include_bias=False), StandardScaler(), LinearRegression())
+        if name == "랜덤포레스트":
+            return RandomForestRegressor(n_estimators=200, random_state=42)
+        return GradientBoostingRegressor(random_state=42)
+
+    c1, c2, c3 = st.columns(3)
+    use_type = c1.checkbox("Type(흡착제 종류) 포함", value=True)
+    val_method = c2.radio("검증 방법", ["5-fold CV", "Type 제외 검증"])
+    thr = c3.slider("고제거 기준값 (%)", 50, 99, 90, 1)
     extra = type_cols if use_type else []
 
-    def cols_of(names):
-        return [REV[n] for n in names] + extra
+    @st.cache_data(show_spinner="모델을 학습하는 중입니다...")
+    def run_all(use_type):
+        kf = KFold(5, shuffle=True, random_state=42)
+        ex = type_cols if use_type else []
+        out = {}
+        for cname, vars_ in COMBOS.items():
+            X = X_all[[REV[n] for n in vars_] + ex]
+            for mname in MODEL_NAMES:
+                cvp = cross_val_predict(make_model(mname), X, y_all, cv=kf)
+                lop = np.zeros(len(df))
+                for t in df["Type"].unique():
+                    idx = (df["Type"] == t).values
+                    lop[idx] = make_model(mname).fit(X[~idx], y_all[~idx]).predict(X[idx])
+                out[(cname, mname)] = (cvp, lop)
+        return out
 
-    kf = KFold(5, shuffle=True, random_state=42)
-    rows, cvps, models = [], {}, {}
-    for name, vars_ in COMBOS.items():
-        cols = cols_of(vars_)
-        X = X_all[cols]
-        cvp = cross_val_predict(LinearRegression(), X, y_all, cv=kf)
-        lo = pd.Series(index=df.index, dtype=float)
-        for t in df["Type"].unique():
-            idx = df["Type"] == t
-            lo[idx] = LinearRegression().fit(X[~idx], y_all[~idx]).predict(X[idx])
-        m = LinearRegression().fit(X, y_all)
-        cvps[name], models[name] = cvp, m
-        rows.append({"조합": name, "변수 수": len(cols),
-                     "R² (학습)": m.score(X, y_all),
-                     "R² (5-fold CV)": r2_score(y_all, cvp),
-                     "R² (Type 제외 검증)": r2_score(y_all, lo),
-                     "MAE (CV)": mean_absolute_error(y_all, cvp),
-                     "RMSE (CV)": np.sqrt(mean_squared_error(y_all, cvp))})
-    res = pd.DataFrame(rows).set_index("조합")
+    preds = run_all(use_type)
+    k = 0 if val_method == "5-fold CV" else 1
 
-    st.subheader("성능 비교표")
-    st.dataframe(res.style.format({"변수 수": "{:.0f}", "R² (학습)": "{:.3f}", "R² (5-fold CV)": "{:.3f}",
-                                   "R² (Type 제외 검증)": "{:.3f}", "MAE (CV)": "{:.2f}", "RMSE (CV)": "{:.2f}"})
-                 .highlight_max(subset=["R² (5-fold CV)", "R² (Type 제외 검증)"], color="#c6efce")
-                 .highlight_min(subset=["MAE (CV)", "RMSE (CV)"], color="#c6efce"),
-                 use_container_width=True)
-    bname = res["R² (5-fold CV)"].idxmax()
-    wname = res["R² (5-fold CV)"].idxmin()
-    gap = res["R² (학습)"] - res["R² (5-fold CV)"]
-    explain(f"- 5-fold CV 기준 최고 조합은 **{bname}** (R² = {res.loc[bname,'R² (5-fold CV)']:.3f}, MAE = {res.loc[bname,'MAE (CV)']:.2f}%p), "
-            f"최저는 **{wname}** (R² = {res.loc[wname,'R² (5-fold CV)']:.3f})입니다. 차이는 {res['R² (5-fold CV)'].max()-res['R² (5-fold CV)'].min():.3f}입니다.\n"
-            f"- 학습 R²와 CV R²의 차이(과적합 정도)는 최대 {gap.max():.3f}입니다. 선형회귀는 단순해서 보통 차이가 작습니다.\n"
-            f"- Type 제외 검증 R²가 CV보다 낮으면 새로운 흡착제에는 덜 정확하다는 뜻입니다.\n"
-            f"- R²가 낮다면 농도·용량처럼 **곡선(비선형)** 관계를 직선으로 근사하기 때문일 수 있습니다.")
+    y_bin = (y_all >= thr).astype(int)
+    pos_rate = y_bin.mean()
+    maj = max(pos_rate, 1 - pos_rate)
+    st.caption(f"기준값 {thr}% 이상 = 고제거. 고제거 비율 {pos_rate*100:.1f}% ({int(y_bin.sum())}/{len(y_bin)}개). "
+               f"무조건 다수 클래스로 찍을 때의 정확도: {maj*100:.1f}%")
 
-    long = res.reset_index().melt(id_vars="조합", value_vars=["R² (학습)", "R² (5-fold CV)", "R² (Type 제외 검증)"],
-                                  var_name="검증방법", value_name="R²")
-    st.plotly_chart(px.bar(long, x="조합", y="R²", color="검증방법", barmode="group"), use_container_width=True)
-    dtime = res.loc["B: pH+Dose+Conc+Temp+Time", "R² (5-fold CV)"] - res.loc["A: pH+Dose+Conc+Temp", "R² (5-fold CV)"]
-    dtemp = res.loc["A: pH+Dose+Conc+Temp", "R² (5-fold CV)"] - res.loc["C: pH+Dose+Conc", "R² (5-fold CV)"]
-    explain(f"- A에 Time을 추가한 B의 CV R² 변화: **{dtime:+.3f}** → "
-            + ("Time은 성능 향상에 기여합니다.\n" if dtime > 0.01 else "Time을 넣어도 거의 달라지지 않아 이 데이터에서는 불필요한 변수입니다.\n")
-            + f"- C에 Temp를 추가한 A의 CV R² 변화: **{dtemp:+.3f}** → "
-            + ("Temp는 성능 향상에 기여합니다." if dtemp > 0.01 else "Temp를 넣어도 거의 달라지지 않습니다."))
+    rows = []
+    for (cname, mname), pr in preds.items():
+        p = pr[k]
+        pb = (p >= thr).astype(int)
+        rows.append({
+            "조합": cname, "모델": mname,
+            "R²": r2_score(y_all, p),
+            "MAE": mean_absolute_error(y_all, p),
+            "RMSE": np.sqrt(mean_squared_error(y_all, p)),
+            "정확도": accuracy_score(y_bin, pb),
+            "재현율": recall_score(y_bin, pb, zero_division=0),
+            "정밀도": precision_score(y_bin, pb, zero_division=0),
+            "F1": f1_score(y_bin, pb, zero_division=0),
+        })
+    res = pd.DataFrame(rows)
+    base = res[res["모델"] == "베이스라인(평균)"].set_index("조합")
+    res["MAE 개선율(%)"] = res.apply(
+        lambda r: (1 - r["MAE"] / base.loc[r["조합"], "MAE"]) * 100, axis=1)
 
-    st.subheader("실제값 vs 예측값 (5-fold CV 예측)")
-    cols3 = st.columns(3)
-    for i, name in enumerate(COMBOS):
-        fig = px.scatter(x=y_all, y=cvps[name], color=df["Type"],
-                         labels={"x": "실제 Removal", "y": "예측 Removal", "color": "Type"}, title=name)
-        fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="y=x",
-                                 line=dict(dash="dash", color="red")))
-        fig.update_layout(showlegend=(i == 2), title_font_size=13)
-        cols3[i].plotly_chart(fig, use_container_width=True)
-    errs = {n: np.abs(y_all - cvps[n]) for n in COMBOS}
-    explain("점이 빨간 점선(y=x)에 가까울수록 정확합니다.\n\n"
-            + "\n".join(f"- **{n}**: 평균 오차 {e.mean():.2f}%p, 최대 오차 {e.max():.1f}%p" for n, e in errs.items())
-            + "\n- 예측값이 100%를 넘거나 0% 아래로 나오면 직선 모델의 한계입니다(Removal은 0~100% 범위).\n"
-              "- 낮은 Removal 구간에서 점이 선에서 멀다면 고농도 조건을 직선으로 잘 설명하지 못한다는 뜻입니다.")
+    st.subheader(f"성능 비교표 ({val_method})")
+    fmt = {"R²": "{:.3f}", "MAE": "{:.2f}", "RMSE": "{:.2f}", "정확도": "{:.3f}", "재현율": "{:.3f}",
+           "정밀도": "{:.3f}", "F1": "{:.3f}", "MAE 개선율(%)": "{:+.1f}"}
+    st.dataframe(res.set_index(["조합", "모델"]).style.format(fmt), use_container_width=True)
 
-    st.subheader("회귀계수 (표준화)")
-    coef_rows = []
-    for name, vars_ in COMBOS.items():
-        cols = cols_of(vars_)
-        Xs = (X_all[cols] - X_all[cols].mean()) / X_all[cols].std()
-        ms = LinearRegression().fit(Xs, y_all)
-        for c, b in zip(cols, ms.coef_):
-            coef_rows.append({"조합": name, "변수": SHORT.get(c, c), "표준화 계수": b})
-    coef_df = pd.DataFrame(coef_rows)
-    st.plotly_chart(px.bar(coef_df, x="변수", y="표준화 계수", color="조합", barmode="group"),
+    nb = res[res["모델"] != "베이스라인(평균)"]
+    bi = nb["R²"].idxmax()
+    br = res.loc[bi]
+    bb = base.loc[br["조합"]]
+    beat = nb.groupby("모델")["R²"].mean().sort_values(ascending=False)
+    explain(f"- 베이스라인(평균 찍기)의 R²는 **{base['R²'].mean():.3f}**(0 근처면 정상), MAE는 약 **{base['MAE'].mean():.2f}%p**입니다. 이것이 넘어야 할 기준선입니다.\n"
+            f"- 가장 좋은 조합·모델은 **{br['조합']} / {br['모델']}** (R² = {br['R²']:.3f}, MAE = {br['MAE']:.2f}%p)로, "
+            f"같은 조합의 베이스라인보다 오차가 **{br['MAE 개선율(%)']:.1f}%** 줄었습니다.\n"
+            f"- 세 조합 평균 R² 순위: " + " > ".join(f"{m}({v:.2f})" for m, v in beat.items()) + "\n"
+            f"- 정확도는 베이스라인도 {base['정확도'].mean():.2f}가 나옵니다. 모델의 정확도가 이 값(또는 다수 클래스 비율 {maj:.2f})과 비슷하면 실질적 개선이 없는 것입니다.\n"
+            f"- 재현율이 높아도 정밀도가 낮으면 '고제거'를 남발하는 모델이므로 F1도 함께 보세요.\n"
+            + ("- Type 제외 검증은 새로운 흡착제에 대한 일반화 능력을 보므로, 5-fold CV보다 점수가 낮은 것이 일반적입니다."
+               if k == 1 else
+               "- 이 데이터는 비슷한 조건의 반복이 많아 5-fold CV가 다소 낙관적입니다. 'Type 제외 검증'으로도 꼭 확인하세요."))
+
+    st.subheader("R² 비교")
+    st.plotly_chart(px.bar(res, x="모델", y="R²", color="조합", barmode="group"), use_container_width=True)
+    explain("막대가 높을수록 좋습니다. 베이스라인(0 근처)보다 낮은 막대는 평균 찍기보다 못한 모델입니다. "
+            "선형회귀보다 다항회귀·트리 모델이 높다면 변수 사이에 **비선형 관계**가 있다는 뜻입니다.")
+
+    st.subheader("정확도 · 재현율 비교")
+    cl = res.melt(id_vars=["조합", "모델"], value_vars=["정확도", "재현율"], var_name="지표", value_name="값")
+    st.plotly_chart(px.bar(cl, x="모델", y="값", color="조합", barmode="group", facet_row="지표"),
                     use_container_width=True)
-    bcoef = coef_df[coef_df["조합"] == bname].copy()
-    bcoef = bcoef[~bcoef["변수"].str.startswith("Type_")]
-    bcoef["abs"] = bcoef["표준화 계수"].abs()
-    bcoef = bcoef.sort_values("abs", ascending=False)
-    explain(f"변수를 같은 스케일(표준편차 1)로 맞춘 뒤의 계수라 **막대 길이로 영향력을 비교**할 수 있습니다. 양수면 값이 클수록 Removal 증가, 음수면 감소입니다.\n\n"
-            f"- 최고 조합 **{bname}** 에서 영향이 가장 큰 변수는 **{bcoef.iloc[0]['변수']}** ({bcoef.iloc[0]['표준화 계수']:+.2f}), "
-            f"그다음은 **{bcoef.iloc[1]['변수']}** ({bcoef.iloc[1]['표준화 계수']:+.2f})입니다.\n"
-            f"- 조합이 바뀌어도 계수의 부호와 크기가 비슷하면 모델이 안정적입니다.")
+    explain(f"- 기준값 {thr}%에서 베이스라인은 항상 한쪽 클래스로만 예측하므로, 재현율이 0 또는 1이 됩니다(고제거를 전부 놓치거나 전부 '고제거'라고 찍음).\n"
+            f"- 모델의 정확도가 다수 클래스 비율({maj:.2f})보다 충분히 높고 재현율도 높아야 의미 있는 모델입니다.\n"
+            f"- 기준값을 바꿔 보세요. 기준을 높이면(예: 95%) 고제거 실험이 줄어 더 까다로운 문제가 됩니다.")
 
-    st.subheader("원 단위 회귀식 (최고 조합)")
-    bm = models[bname]
-    bcols = cols_of(COMBOS[bname])
-    eq = pd.DataFrame({"변수": [SHORT.get(c, c) for c in bcols], "계수": bm.coef_})
-    eq.loc[len(eq)] = ["절편", bm.intercept_]
-    st.dataframe(eq.style.format({"계수": "{:.4f}"}), use_container_width=True, hide_index=True)
-    explain("변수가 1단위 늘 때 Removal(%)이 얼마나 변하는지를 보여줍니다(다른 변수는 고정). "
-            "예: Conc 계수가 −0.1이면 오염물질 농도가 10 mg/L 늘 때 Removal이 약 1%p 감소합니다.")
+    st.subheader("상세 확인: 실제값 vs 예측값 · 혼동행렬")
+    s1, s2 = st.columns(2)
+    sc_name = s1.selectbox("조합", list(COMBOS), key="sel_c")
+    sm_name = s2.selectbox("모델", MODEL_NAMES, index=3, key="sel_m")
+    p = preds[(sc_name, sm_name)][k]
+    g1, g2 = st.columns(2)
+    fig = px.scatter(x=y_all, y=p, color=df["Type"],
+                     labels={"x": "실제 Removal", "y": "예측 Removal", "color": "Type"})
+    fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="y=x",
+                             line=dict(dash="dash", color="red")))
+    fig.add_hline(y=thr, line_dash="dot", line_color="gray")
+    fig.add_vline(x=thr, line_dash="dot", line_color="gray")
+    g1.plotly_chart(fig, use_container_width=True)
+    cm = confusion_matrix(y_bin, (p >= thr).astype(int), labels=[0, 1])
+    fig2 = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
+                     x=["예측: 저제거", "예측: 고제거"], y=["실제: 저제거", "실제: 고제거"])
+    g2.plotly_chart(fig2, use_container_width=True)
+    tn, fp, fn, tp = cm.ravel()
+    err = np.abs(y_all - p)
+    explain(f"**{sc_name} / {sm_name}** ({val_method})\n\n"
+            f"- 평균 오차 {err.mean():.2f}%p, 최대 오차 {err.max():.1f}%p\n"
+            f"- 왼쪽: 점이 빨간 점선(y=x)에 가까울수록 정확합니다. 회색 점선 기준 오른쪽 위·왼쪽 아래 칸의 점이 올바른 분류입니다.\n"
+            f"- 오른쪽 혼동행렬: 고제거를 맞힌 것 {tp}개, 놓친 것 {fn}개(재현율 {tp/max(tp+fn,1):.2f}), "
+            f"저제거를 고제거로 잘못 예측한 것 {fp}개.\n"
+            f"- 예측이 0~100%를 벗어난 개수: {int(((p < 0) | (p > 100)).sum())}개 (선형·다항회귀의 한계)")
 
     st.subheader("직접 예측해 보기")
-    pc = st.columns(4)
-    pname = pc[0].selectbox("사용할 조합", list(COMBOS))
-    typ = pc[1].selectbox("Type", sorted(df["Type"].unique()), disabled=not use_type)
-    vals = {}
-    vars_ = COMBOS[pname]
-    ranges = {"pH": (3.0, 10.0, 5.0, 0.5), "Dose": (0.4, 6.0, 2.0, 0.1), "Conc": (10, 500, 100, 10),
-              "Temp": (25, 55, 25, 5), "Time": (30, 600, 300, 30)}
-    sc = st.columns(len(vars_))
-    for i, n in enumerate(vars_):
-        lo_, hi_, d_, st_ = ranges[n]
-        vals[REV[n]] = sc[i].slider(n, lo_, hi_, d_, st_)
-    row = dict(vals)
-    for c in extra:
-        row[c] = int(c == f"Type_{typ}")
-    pcols = cols_of(vars_)
-    pred = models[pname].predict(pd.DataFrame([row])[pcols])[0]
-    pm = res.loc[pname, "MAE (CV)"]
-    st.metric(f"예측 Removal ({pname})", f"{pred:.1f}%")
-    explain(f"선택한 조건에서 **{pname}** 모델의 예측값은 **{pred:.1f}%**이고, CV 평균 오차({pm:.1f}%p)를 고려하면 "
-            f"약 {max(pred-pm,0):.1f}~{min(pred+pm,100):.1f}% 범위로 볼 수 있습니다.\n\n"
-            + ("⚠️ 예측값이 0~100%를 벗어났습니다. 선형회귀가 범위 밖 값을 만들 수 있으니 실제로는 0 또는 100%로 해석하세요."
-               if pred < 0 or pred > 100 else
-               "선형회귀는 직선 관계를 가정하므로, 실험하지 않은 조합이나 범위 밖 값의 예측은 신뢰도가 낮습니다."))
+    pc = st.columns(3)
+    pc_name = pc[0].selectbox("조합", list(COMBOS), key="pr_c")
+    pm_name = pc[1].selectbox("모델", MODEL_NAMES[1:], index=2, key="pr_m")
+    typ = pc[2].selectbox("Type", sorted(df["Type"].unique()), disabled=not use_type, key="pr_t")
+    ranges = {"pH": (3.0, 10.0, 5.0, 0.5), "Dose": (0.4, 6.0, 2.0, 0.1), "Conc": (10
