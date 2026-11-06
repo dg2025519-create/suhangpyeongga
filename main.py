@@ -447,3 +447,172 @@ elif page == "4. 조합·모델 비교":
             f"저제거를 고제거로 잘못 예측한 것 {fp}개.\n"
             f"- 예측이 0~100%를 벗어난 개수: {int(((p < 0) | (p > 100)).sum())}개 (선형·다항회귀의 한계)")
 
+# ================= 5. 최종 모델·조합 선정 =================
+else:
+    st.header("🏁 최종 모델·변수 조합 선정")
+    st.markdown("4페이지의 비교 결과를 바탕으로 **최종 모델 1개와 변수 조합 1개**를 선택하고, 그 이유를 정리합니다.")
+
+    COMBOS = {
+        "A: pH+Dose+Conc+Temp": ["pH", "Dose", "Conc", "Temp"],
+        "B: pH+Dose+Conc+Temp+Time": ["pH", "Dose", "Conc", "Temp", "Time"],
+        "C: pH+Dose+Conc": ["pH", "Dose", "Conc"],
+    }
+    CAND = ["선형회귀", "다항회귀(2차)", "랜덤포레스트", "그래디언트부스팅"]   # 단순한 순서
+    BASE = "베이스라인(평균)"
+
+    def make_model(name):
+        if name == BASE:
+            return DummyRegressor(strategy="mean")
+        if name == "선형회귀":
+            return LinearRegression()
+        if name == "다항회귀(2차)":
+            return make_pipeline(PolynomialFeatures(2, include_bias=False), StandardScaler(), LinearRegression())
+        if name == "랜덤포레스트":
+            return RandomForestRegressor(n_estimators=200, random_state=42)
+        return GradientBoostingRegressor(random_state=42)
+
+    c1, c2, c3 = st.columns(3)
+    use_type = c1.checkbox("Type(흡착제 종류) 포함", value=True, key="f_type")
+    tol_m = c2.slider("모델 선택: 단순 모델 우대 허용 폭 (R²)", 0.0, 0.1, 0.02, 0.005)
+    tol_c = c3.slider("조합 선택: 적은 변수 우대 허용 폭 (R²)", 0.0, 0.05, 0.01, 0.005)
+
+    @st.cache_data(show_spinner="모든 모델·조합을 평가하는 중입니다...")
+    def run_final(use_type):
+        kf = KFold(5, shuffle=True, random_state=42)
+        ex = type_cols if use_type else []
+        out = {}
+        for cname, vars_ in COMBOS.items():
+            X = X_all[[REV[n] for n in vars_] + ex]
+            for mname in [BASE] + CAND:
+                cvp = cross_val_predict(make_model(mname), X, y_all, cv=kf)
+                lop = np.zeros(len(df))
+                for t in df["Type"].unique():
+                    idx = (df["Type"] == t).values
+                    lop[idx] = make_model(mname).fit(X[~idx], y_all[~idx]).predict(X[idx])
+                out[(cname, mname)] = (cvp, lop)
+        return out
+
+    preds = run_final(use_type)
+
+    rows = []
+    for (cname, mname), (cvp, lop) in preds.items():
+        r_cv, r_ty = r2_score(y_all, cvp), r2_score(y_all, lop)
+        rows.append({"조합": cname, "모델": mname, "변수 수": len(COMBOS[cname]),
+                     "R² (CV)": r_cv, "R² (Type 제외)": r_ty, "점수(평균)": (r_cv + r_ty) / 2,
+                     "MAE (CV)": mean_absolute_error(y_all, cvp),
+                     "MAE (Type 제외)": mean_absolute_error(y_all, lop),
+                     "0~100 이탈 수": int(((cvp < 0) | (cvp > 100)).sum())})
+    res = pd.DataFrame(rows)
+    cand = res[res["모델"] != BASE]
+
+    # ---------- 1단계: 모델 선택 ----------
+    m_score = cand.groupby("모델")["점수(평균)"].mean().reindex(CAND)
+    m_best = m_score.idxmax()
+    m_ok = [m for m in CAND if m_score[m] >= m_score[m_best] - tol_m]
+    chosen_m = m_ok[0]   # CAND 순서가 단순한 순서
+
+    st.subheader("① 모델 선택")
+    m_df = pd.DataFrame({"평균 점수": m_score,
+                         "평균 R² (CV)": cand.groupby("모델")["R² (CV)"].mean().reindex(CAND),
+                         "평균 R² (Type 제외)": cand.groupby("모델")["R² (Type 제외)"].mean().reindex(CAND),
+                         "평균 MAE (CV)": cand.groupby("모델")["MAE (CV)"].mean().reindex(CAND)})
+    base_row = res[res["모델"] == BASE]
+    m_df.loc[BASE] = [base_row["점수(평균)"].mean(), base_row["R² (CV)"].mean(),
+                      base_row["R² (Type 제외)"].mean(), base_row["MAE (CV)"].mean()]
+    st.dataframe(m_df.style.format("{:.3f}").highlight_max(axis=0, subset=["평균 점수"], color="#c6efce"),
+                 use_container_width=True)
+    fig = px.bar(m_df.reset_index().rename(columns={"index": "모델"}), x="모델", y="평균 점수",
+                 color="모델")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.success(f"✅ 선택한 모델: **{chosen_m}**")
+
+    base_mae = m_df.loc[BASE, "평균 MAE (CV)"]
+    cm_mae = m_df.loc[chosen_m, "평균 MAE (CV)"]
+    oob = cand[cand["모델"] == chosen_m]["0~100 이탈 수"].sum()
+    why_model = {
+        "선형회귀": "변수 효과를 **계수(식)로 설명**할 수 있고, 학습 범위 밖에서도 안정적으로 계산되며, 데이터가 약 100행으로 적어 과적합 위험이 가장 낮습니다.",
+        "다항회귀(2차)": "선형회귀를 확장해 **곡선 관계(농도·용량의 포화 등)** 를 반영하면서도 회귀식으로 설명할 수 있어, 정확도와 해석 가능성의 균형이 좋습니다.",
+        "랜덤포레스트": "변수 사이의 **비선형·상호작용**을 자동으로 반영해 정확도가 높고, 예측값이 학습 데이터 범위 안에 머물러 0~100%를 벗어나지 않습니다.",
+        "그래디언트부스팅": "앞선 트리의 오차를 보완하며 학습해 **정확도가 가장 높은 계열**이고, 비선형·상호작용을 잘 반영합니다.",
+    }[chosen_m]
+    note = ""
+    if chosen_m != m_best:
+        note = (f"- 점수 1위는 **{m_best}** ({m_score[m_best]:.3f})지만, 차이가 허용 폭({tol_m}) 이내라 "
+                f"더 단순한 **{chosen_m}** ({m_score[chosen_m]:.3f})을 선택했습니다. 점수가 비슷하면 단순한 모델이 설명하기 쉽고 새 데이터에서 덜 흔들립니다.\n")
+    else:
+        note = f"- 평균 점수 **{m_score[chosen_m]:.3f}** 로 후보 중 1위입니다(허용 폭 {tol_m} 안에 더 단순한 모델이 없거나 같은 모델이 1위).\n"
+    explain(f"**선택 이유**\n\n{note}"
+            f"- 평균 MAE는 베이스라인 {base_mae:.2f}%p → {chosen_m} {cm_mae:.2f}%p로 **{(1-cm_mae/base_mae)*100:.1f}% 감소**했습니다. "
+            f"평균 찍기보다 실험조건을 쓰는 것이 분명히 낫다는 근거입니다.\n"
+            f"- Type 제외 평균 R²는 {m_df.loc[chosen_m,'평균 R² (Type 제외)']:.3f}로, 새로운 흡착제에 대한 일반화 성능도 평가에 반영했습니다 "
+            f"(5-fold CV는 {m_df.loc[chosen_m,'평균 R² (CV)']:.3f}).\n"
+            f"- {why_model}\n"
+            + (f"- ⚠️ 이 모델은 CV 예측에서 0~100%를 벗어난 값이 {oob}개 나왔습니다. 실제 사용 시 0~100%로 잘라서 해석해야 합니다.\n" if oob > 0 else "")
+            + "- 점수는 CV와 Type 제외 R²의 평균입니다. 이 데이터는 비슷한 조건이 반복되어 CV만 쓰면 점수가 높게 나오기 때문입니다.")
+
+    # ---------- 2단계: 조합 선택 ----------
+    st.subheader(f"② 변수 조합 선택 ({chosen_m} 기준)")
+    sub = cand[cand["모델"] == chosen_m].set_index("조합")
+    c_best = sub["점수(평균)"].idxmax()
+    c_ok = sub[sub["점수(평균)"] >= sub.loc[c_best, "점수(평균)"] - tol_c].sort_values(["변수 수", "점수(평균)"], ascending=[True, False])
+    chosen_c = c_ok.index[0]
+
+    show = sub[["변수 수", "R² (CV)", "R² (Type 제외)", "점수(평균)", "MAE (CV)", "MAE (Type 제외)"]]
+    st.dataframe(show.style.format({"변수 수": "{:.0f}", "R² (CV)": "{:.3f}", "R² (Type 제외)": "{:.3f}",
+                                    "점수(평균)": "{:.3f}", "MAE (CV)": "{:.2f}", "MAE (Type 제외)": "{:.2f}"})
+                 .highlight_max(subset=["점수(평균)"], color="#c6efce"), use_container_width=True)
+    lg = sub.reset_index().melt(id_vars="조합", value_vars=["R² (CV)", "R² (Type 제외)"],
+                                var_name="검증방법", value_name="R²")
+    st.plotly_chart(px.bar(lg, x="조합", y="R²", color="검증방법", barmode="group"), use_container_width=True)
+
+    st.success(f"✅ 선택한 변수 조합: **{chosen_c}**")
+
+    sA, sB, sC = (sub.loc[k, "점수(평균)"] for k in COMBOS)
+    d_time, d_temp = sB - sA, sA - sC
+    if chosen_c != c_best:
+        cnote = (f"- 점수 1위는 **{c_best}** ({sub.loc[c_best,'점수(평균)']:.3f})지만, 차이가 허용 폭({tol_c}) 이내라 "
+                 f"변수가 더 적은 **{chosen_c}** ({sub.loc[chosen_c,'점수(평균)']:.3f})를 선택했습니다. 변수가 적으면 측정·실험 부담이 줄어듭니다.\n")
+    else:
+        cnote = f"- 평균 점수 **{sub.loc[chosen_c,'점수(평균)']:.3f}** 로 세 조합 중 1위입니다.\n"
+    explain(f"**선택 이유**\n\n{cnote}"
+            f"- **Time 효과**: A에 Time을 추가한 B의 점수 변화는 **{d_time:+.3f}** → "
+            + ("Time이 성능을 의미 있게 높입니다.\n" if d_time > tol_c else "Time을 넣어도 성능이 거의 오르지 않아, 이 데이터에서는 필요성이 낮습니다. "
+               "시간은 일정 시점 이후 흡착이 평형에 도달해 Removal이 거의 변하지 않기 때문일 수 있습니다.\n")
+            + f"- **Temp 효과**: C에 Temp를 추가한 A의 점수 변화는 **{d_temp:+.3f}** → "
+            + ("Temp가 성능을 의미 있게 높입니다.\n" if d_temp > tol_c else "Temp를 넣어도 성능이 거의 오르지 않습니다.\n")
+            + f"- 선택 조합의 MAE는 CV {sub.loc[chosen_c,'MAE (CV)']:.2f}%p, Type 제외 {sub.loc[chosen_c,'MAE (Type 제외)']:.2f}%p입니다.\n"
+            + "- 온도·시간은 일부 조건에서만 변화시킨 실험이라(온도 4수준, 시간 11수준), 이들 변수의 효과는 데이터가 적은 만큼 불확실합니다.")
+
+    # ---------- 3단계: 최종 결과 확인 ----------
+    st.subheader("③ 최종 선택 모델의 예측 성능")
+    p_cv, p_ty = preds[(chosen_c, chosen_m)]
+    pb_cv, _ = preds[(chosen_c, BASE)]
+    g1, g2 = st.columns(2)
+    for col, title, p in [(g1, "5-fold CV 예측", p_cv), (g2, "Type 제외 검증 예측", p_ty)]:
+        fig = px.scatter(x=y_all, y=p, color=df["Type"], title=title,
+                         labels={"x": "실제 Removal", "y": "예측 Removal", "color": "Type"})
+        fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="y=x",
+                                 line=dict(dash="dash", color="red")))
+        col.plotly_chart(fig, use_container_width=True)
+
+    e_cv, e_ty = np.abs(y_all - p_cv), np.abs(y_all - p_ty)
+    low = y_all < 70
+    explain(f"- 최종 선택: **{chosen_m} + {chosen_c}**\n"
+            f"- 평균 오차: CV **{e_cv.mean():.2f}%p**, Type 제외 **{e_ty.mean():.2f}%p** (베이스라인 CV {mean_absolute_error(y_all, pb_cv):.2f}%p)\n"
+            f"- Removal 70% 미만 구간 평균 오차 {e_cv[low].mean():.2f}%p, 70% 이상 {e_cv[~low].mean():.2f}%p → "
+            + ("고농도·낮은 제거율 구간에서 오차가 더 큽니다.\n" if e_cv[low].mean() > e_cv[~low].mean() else "구간별 오차가 비슷합니다.\n")
+            + f"- CV 오차보다 Type 제외 오차가 {'큽니다. 새로운 흡착제에는 조금 덜 정확하므로, 새 흡착제를 쓸 때는 소량의 실험 데이터를 추가하는 것이 좋습니다.' if e_ty.mean() > e_cv.mean() else '크지 않아 흡착제 종류가 달라져도 일반화가 양호합니다.'}")
+
+    st.subheader("④ 결론")
+    r2_final = r2_score(y_all, p_ty)
+    st.markdown(
+        f"- **최종 모델**: {chosen_m}\n- **최종 변수 조합**: {chosen_c}"
+        f"{' + Type(흡착제 종류)' if use_type else ''}\n"
+        f"- **검증 R²**: CV {r2_score(y_all, p_cv):.3f}, Type 제외 {r2_final:.3f}\n"
+        f"- **질문에 대한 답**: " +
+        ("실험조건만으로 Removal을 **높은 정확도로 예측할 수 있습니다.**" if r2_final >= 0.8 else
+         "실험조건으로 Removal의 **경향은 예측할 수 있으나**, 새로운 흡착제나 조건에서는 오차가 있습니다." if r2_final >= 0.5 else
+         "현재 변수만으로는 **새로운 흡착제에 대한 예측이 어렵습니다.** 같은 흡착제 안에서의 조건 변화만 예측 가능합니다."))
+    st.caption("⚠️ 모델·조합 선택에 쓴 점수와 최종 점수가 같은 데이터에서 나왔으므로, 실제 성능은 다소 낮을 수 있습니다. "
+               "여러 후보 중 최고를 고르는 과정에서 점수가 낙관적으로 나오기 때문입니다.")
