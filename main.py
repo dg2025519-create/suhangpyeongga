@@ -446,34 +446,3 @@ else:
             f"저제거를 고제거로 잘못 예측한 것 {fp}개.\n"
             f"- 예측이 0~100%를 벗어난 개수: {int(((p < 0) | (p > 100)).sum())}개 (선형·다항회귀의 한계)")
 
-     st.subheader("직접 예측해 보기")
-    pc = st.columns(3)
-    pc_name = pc[0].selectbox("조합", list(COMBOS), key="pr_c")
-    pm_name = pc[1].selectbox("모델", MODEL_NAMES[1:], index=2, key="pr_m")
-    typ = pc[2].selectbox("Type", sorted(df["Type"].unique()), disabled=not use_type, key="pr_t")
-
-    ranges = {"pH": (3.0, 10.0, 5.0, 0.5), "Dose": (0.4, 6.0, 2.0, 0.1),
-              "Conc": (10, 500, 100, 10), "Temp": (25, 55, 25, 5), "Time": (30, 600, 300, 30)}
-    vars_ = COMBOS[pc_name]
-    sc = st.columns(len(vars_))
-    row = {}
-    for i, n in enumerate(vars_):
-        a, b, d, s_ = ranges[n]
-        row[REV[n]] = sc[i].slider(n, a, b, d, s_, key=f"pr_{n}")
-    for c in extra:
-        row[c] = int(c == f"Type_{typ}")
-
-    pcols = [REV[n] for n in vars_] + extra
-    final_model = make_model(pm_name).fit(X_all[pcols], y_all)
-    pred = final_model.predict(pd.DataFrame([row])[pcols])[0]
-
-    sel_row = res[(res["조합"] == pc_name) & (res["모델"] == pm_name)].iloc[0]
-    mae_sel = sel_row["MAE"]
-    st.metric(f"예측 Removal ({pc_name} / {pm_name})", f"{pred:.1f}%")
-    label = "고제거" if pred >= thr else "저제거"
-    explain(f"선택한 조건에서 **{pm_name}** 모델의 예측값은 **{pred:.1f}%**로, 기준값 {thr}% 기준 **{label}** 로 분류됩니다.\n\n"
-            f"- {val_method} 평균 오차({mae_sel:.1f}%p)를 고려하면 약 {max(pred-mae_sel,0):.1f}~{min(pred+mae_sel,100):.1f}% 범위로 볼 수 있습니다.\n"
-            + ("- ⚠️ 예측값이 0~100%를 벗어났습니다. 실제로는 0 또는 100%로 해석하세요.\n"
-               if pred < 0 or pred > 100 else "")
-            + "- 랜덤포레스트·그래디언트부스팅은 학습 범위 밖 값을 외삽하지 못하고, "
-              "선형·다항회귀는 범위 밖에서 값이 크게 튈 수 있습니다. 실험하지 않은 조건의 예측은 참고용입니다.")
