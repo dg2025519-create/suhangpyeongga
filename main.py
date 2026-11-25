@@ -607,3 +607,78 @@ else:
          "같은 흡착제 안의 조건 변화는 예측할 수 있지만, **새로운 흡착제 예측은 어렵습니다.**"))
     st.caption("⚠️ 모델을 먼저 정하고 근거를 찾은 구조이므로, 보고서에는 순위와 점수를 있는 그대로 적으세요. "
                "또 조합 선택에 쓴 점수와 최종 점수가 같은 데이터에서 나와 실제 성능은 다소 낮을 수 있습니다.")
+
+    # ---------- ⑤ 종합 결론 ----------
+    st.subheader("⑤ 종합 결론")
+
+    y_np = y_all.values
+    p_ty_np, p_cv_np = np.asarray(p_ty), np.asarray(p_cv)
+
+    # (1) 흡착제별 성능 (Type 제외 검증)
+    trows = []
+    for t in sorted(df["Type"].unique()):
+        m = (df["Type"] == t).values
+        trows.append({"흡착제": t, "실험 수": int(m.sum()),
+                      "R² (Type 제외)": r2_score(y_np[m], p_ty_np[m]),
+                      "MAE (Type 제외)": mean_absolute_error(y_np[m], p_ty_np[m]),
+                      "MAE (CV)": mean_absolute_error(y_np[m], p_cv_np[m])})
+    tdf = pd.DataFrame(trows).set_index("흡착제")
+    st.markdown("**흡착제별 예측 성능** (그 흡착제를 숨기고 예측한 결과)")
+    st.dataframe(tdf.style.format({"실험 수": "{:.0f}", "R² (Type 제외)": "{:.3f}",
+                                   "MAE (Type 제외)": "{:.2f}", "MAE (CV)": "{:.2f}"}),
+                 use_container_width=True)
+    t_best, t_worst = tdf["MAE (Type 제외)"].idxmin(), tdf["MAE (Type 제외)"].idxmax()
+    explain(f"- 새로운 흡착제로 예측했을 때 오차가 가장 작은 것은 **{t_best}** ({tdf.loc[t_best,'MAE (Type 제외)']:.2f}%p), "
+            f"가장 큰 것은 **{t_worst}** ({tdf.loc[t_worst,'MAE (Type 제외)']:.2f}%p)입니다.\n"
+            "- 오차가 큰 흡착제는 나머지 두 종류와 성질이 달라서 다른 흡착제의 규칙이 잘 통하지 않는다는 뜻입니다.")
+
+    # (2) 농도 구간별 오차
+    conc = df["Concentration (mg/L)"]
+    edf = pd.DataFrame({"농도": conc, "CV 오차": np.abs(y_np - p_cv_np),
+                        "Type 제외 오차": np.abs(y_np - p_ty_np)})
+    edf["농도 구간"] = pd.cut(edf["농도"], [0, 50, 150, 300, 1e9],
+                          labels=["~50", "50~150", "150~300", "300 이상"])
+    cg = edf.groupby("농도 구간", observed=True)[["CV 오차", "Type 제외 오차"]].mean().reset_index()
+    cg_l = cg.melt(id_vars="농도 구간", var_name="검증방법", value_name="평균 오차(%p)")
+    st.markdown("**농도 구간별 평균 오차**")
+    st.plotly_chart(px.bar(cg_l, x="농도 구간", y="평균 오차(%p)", color="검증방법", barmode="group"),
+                    use_container_width=True)
+    worst_c = cg.loc[cg["Type 제외 오차"].idxmax(), "농도 구간"]
+    best_c2 = cg.loc[cg["Type 제외 오차"].idxmin(), "농도 구간"]
+    explain(f"- 오차가 가장 큰 농도 구간은 **{worst_c}**, 가장 작은 구간은 **{best_c2}** 입니다.\n"
+            "- 농도가 높으면 Removal이 낮고 값의 변동이 커서 예측이 어려운 경향이 있습니다. "
+            "이 구간의 실험이 적다면 오차가 더 커질 수 있습니다.")
+
+    # (3) 변수 중요도
+    fcols = [REV[n] for n in COMBOS[chosen_c]] + (type_cols if use_type else [])
+    gbm = make_model(FINAL_MODEL).fit(X_all[fcols], y_all)
+    imp = pd.Series(gbm.feature_importances_, index=fcols)
+    tsum = imp[[c for c in fcols if c.startswith("Type_")]].sum()
+    imp = imp[[c for c in fcols if not c.startswith("Type_")]]
+    imp.index = [SHORT[c] for c in imp.index]
+    if use_type:
+        imp["Type"] = tsum
+    imp = imp.sort_values(ascending=False)
+    st.markdown("**변수 중요도** (전체 데이터로 학습한 최종 모델)")
+    st.plotly_chart(px.bar(x=imp.index, y=imp.values, labels={"x": "변수", "y": "중요도"}),
+                    use_container_width=True)
+    explain(f"- 가장 중요한 변수는 **{imp.index[0]}** ({imp.iloc[0]*100:.1f}%), 그다음은 **{imp.index[1]}** ({imp.iloc[1]*100:.1f}%)입니다.\n"
+            "- 중요도는 트리가 값을 나눌 때 그 변수를 얼마나 유용하게 썼는지의 합이며, 합계는 100%입니다. "
+            "'영향의 방향(증가/감소)'은 알려주지 않으므로 방향은 2페이지의 조건별 변화 그래프로 확인합니다.")
+
+    # (4) 최종 결론문
+    r2_gap = r2_cv - r2_ty
+    st.markdown("### 📝 최종 결론")
+    st.markdown(
+        f"1. **예측 가능성**: {FINAL_MODEL}과 변수 조합 {chosen_c}로 Removal을 예측했을 때 "
+        f"CV R² = **{r2_cv:.3f}**, Type 제외 R² = **{r2_ty:.3f}**, 평균 오차 = **{e_cv.mean():.2f}%p**(CV)였고, "
+        f"평균만 예측하는 베이스라인({mean_absolute_error(y_all, pb_cv):.2f}%p)보다 "
+        f"**{(1-e_cv.mean()/mean_absolute_error(y_all, pb_cv))*100:.1f}%** 오차가 작았습니다.\n"
+        f"2. **중요한 변수**: 예측에 가장 크게 기여한 변수는 **{imp.index[0]}**, **{imp.index[1]}** 입니다.\n"
+        f"3. **일반화**: CV와 Type 제외 R²의 차이는 {r2_gap:.3f}입니다. "
+        + ("차이가 커서 같은 흡착제 안에서는 잘 맞지만 새로운 흡착제에는 약합니다.\n" if r2_gap > 0.1
+           else "차이가 작아 새로운 흡착제에도 어느 정도 통합니다.\n")
+        + f"4. **약점**: 새 흡착제 중 **{t_worst}** 예측이 가장 어렵고, 농도 **{worst_c}** 구간에서 오차가 가장 컸습니다.\n"
+        "5. **활용**: 비슷한 흡착제의 조건 변화 실험은 이 모델로 미리 예측해 실험 횟수를 줄일 수 있지만, "
+        "완전히 새로운 흡착제는 소량의 실험으로 확인하는 과정이 필요합니다."
+    )
