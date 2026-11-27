@@ -632,24 +632,53 @@ else:
             f"가장 큰 것은 **{t_worst}** ({tdf.loc[t_worst,'MAE (Type 제외)']:.2f}%p)입니다.\n"
             "- 오차가 큰 흡착제는 나머지 두 종류와 성질이 달라서 다른 흡착제의 규칙이 잘 통하지 않는다는 뜻입니다.")
 
-    # (2) 농도 구간별 오차
-    conc = df["Concentration (mg/L)"]
-    edf = pd.DataFrame({"농도": conc, "CV 오차": np.abs(y_np - p_cv_np),
-                        "Type 제외 오차": np.abs(y_np - p_ty_np)})
-    edf["농도 구간"] = pd.cut(edf["농도"], [0, 50, 150, 300, 1e9],
-                          labels=["~50", "50~150", "150~300", "300 이상"])
-    cg = edf.groupby("농도 구간", observed=True)[["CV 오차", "Type 제외 오차"]].mean().reset_index()
-    cg_l = cg.melt(id_vars="농도 구간", var_name="검증방법", value_name="평균 오차(%p)")
-    st.markdown("**농도 구간별 평균 오차**")
-    st.plotly_chart(px.bar(cg_l, x="농도 구간", y="평균 오차(%p)", color="검증방법", barmode="group"),
+      # (2) 농도 그룹별 오차: 10 / 100 / 기타(각 3행)
+    conc_v = df["Concentration (mg/L)"].values
+    grp = np.where(conc_v == 10, "10 mg/L", np.where(conc_v == 100, "100 mg/L", "기타 농도(각 3행)"))
+    gdf = pd.DataFrame({"그룹": grp,
+                        "CV 오차": np.abs(y_np - p_cv_np),
+                        "Type 제외 오차": np.abs(y_np - p_ty_np),
+                        "실제 Removal": y_np})
+    order = ["10 mg/L", "100 mg/L", "기타 농도(각 3행)"]
+    gs = gdf.groupby("그룹").agg(행수=("CV 오차", "size"),
+                                 평균_Removal=("실제 Removal", "mean"),
+                                 CV_MAE=("CV 오차", "mean"),
+                                 Type제외_MAE=("Type 제외 오차", "mean")).reindex(order)
+    st.markdown("**농도 그룹별 예측 오차** (10 mg/L, 100 mg/L, 그 외 샘플이 적은 농도)")
+    st.dataframe(gs.style.format({"행수": "{:.0f}", "평균_Removal": "{:.1f}",
+                                  "CV_MAE": "{:.2f}", "Type제외_MAE": "{:.2f}"}),
+                 use_container_width=True)
+    gl = gs.reset_index().melt(id_vars=["그룹", "행수"], value_vars=["CV_MAE", "Type제외_MAE"],
+                               var_name="검증방법", value_name="평균 오차(%p)")
+    gl["그룹(행수)"] = gl["그룹"] + " (" + gl["행수"].astype(int).astype(str) + "행)"
+    st.plotly_chart(px.bar(gl, x="그룹(행수)", y="평균 오차(%p)", color="검증방법", barmode="group",
+                           category_orders={"그룹(행수)": [f"{g} ({int(gs.loc[g,'행수'])}행)" for g in order]}),
                     use_container_width=True)
-    worst_c = cg.loc[cg["Type 제외 오차"].idxmax(), "농도 구간"]
-    best_c2 = cg.loc[cg["Type 제외 오차"].idxmin(), "농도 구간"]
-    explain(f"- 오차가 가장 큰 농도 구간은 **{worst_c}**, 가장 작은 구간은 **{best_c2}** 입니다.\n"
-            "- 농도가 높으면 Removal이 낮고 값의 변동이 커서 예측이 어려운 경향이 있습니다. "
-            "이 구간의 실험이 적다면 오차가 더 커질 수 있습니다.")
 
-    # (3) 변수 중요도
+    with st.expander("기타 농도를 값별로 보기 (각 3행)"):
+        od = gdf.assign(농도=conc_v)
+        od = od[od["그룹"] == "기타 농도(각 3행)"].groupby("농도").agg(
+            행수=("CV 오차", "size"), 평균_Removal=("실제 Removal", "mean"),
+            CV_MAE=("CV 오차", "mean"), Type제외_MAE=("Type 제외 오차", "mean")).reset_index()
+        st.dataframe(od.style.format({"농도": "{:.0f}", "행수": "{:.0f}", "평균_Removal": "{:.1f}",
+                                      "CV_MAE": "{:.2f}", "Type제외_MAE": "{:.2f}"}),
+                     use_container_width=True, hide_index=True)
+
+    worst_c = gs["Type제외_MAE"].idxmax()
+    rare, common = gs.loc[order[2]], gs.loc[order[:2]]
+    common_cv = np.average(common["CV_MAE"], weights=common["행수"])
+    common_ty = np.average(common["Type제외_MAE"], weights=common["행수"])
+    explain(f"- 샘플이 적은 기타 농도(24행)의 평균 오차는 CV **{rare['CV_MAE']:.2f}%p**, Type 제외 **{rare['Type제외_MAE']:.2f}%p**입니다.\n"
+            f"- 샘플이 많은 10·100 mg/L(81행)는 CV **{common_cv:.2f}%p**, Type 제외 **{common_ty:.2f}%p**입니다.\n"
+            + ("- 샘플이 적은 농도에서 오차가 더 큽니다. 학습에서 본 경험이 적기 때문일 수 있습니다.\n"
+               if rare["CV_MAE"] > common_cv else
+               "- 샘플이 적은 농도에서도 오차가 더 크지는 않았습니다.\n")
+            + f"- 평균 Removal이 그룹마다 다릅니다(10: {gs.loc[order[0],'평균_Removal']:.1f}%, 100: {gs.loc[order[1],'평균_Removal']:.1f}%, "
+              f"기타: {rare['평균_Removal']:.1f}%). 고농도일수록 Removal이 낮고 변동이 커서, 오차 차이가 샘플 수 때문인지 "
+              "농도 자체의 예측 난이도 때문인지는 이 데이터만으로 구분할 수 없습니다.\n"
+            "- 기타 농도는 값별로 3행뿐이라 평균이 불안정합니다. 경향으로만 해석하세요.")
+
+    # (3) 변수 중요도 (다시 그림)
     fcols = [REV[n] for n in COMBOS[chosen_c]] + (type_cols if use_type else [])
     gbm = make_model(FINAL_MODEL).fit(X_all[fcols], y_all)
     imp = pd.Series(gbm.feature_importances_, index=fcols)
@@ -658,14 +687,19 @@ else:
     imp.index = [SHORT[c] for c in imp.index]
     if use_type:
         imp["Type"] = tsum
-    imp = imp.sort_values(ascending=False)
+    imp = imp.sort_values(ascending=True)
+    imp_df = pd.DataFrame({"변수": imp.index, "중요도(%)": imp.values * 100})
+    fig = px.bar(imp_df, x="중요도(%)", y="변수", orientation="h", text=imp_df["중요도(%)"].map("{:.1f}%".format),
+                 color="중요도(%)", color_continuous_scale="Blues")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(coloraxis_showscale=False, xaxis_title="중요도 (%)", yaxis_title="")
     st.markdown("**변수 중요도** (전체 데이터로 학습한 최종 모델)")
-    st.plotly_chart(px.bar(x=imp.index, y=imp.values, labels={"x": "변수", "y": "중요도"}),
-                    use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
+    imp = imp.sort_values(ascending=False)
     explain(f"- 가장 중요한 변수는 **{imp.index[0]}** ({imp.iloc[0]*100:.1f}%), 그다음은 **{imp.index[1]}** ({imp.iloc[1]*100:.1f}%)입니다.\n"
-            "- 중요도는 트리가 값을 나눌 때 그 변수를 얼마나 유용하게 썼는지의 합이며, 합계는 100%입니다. "
-            "'영향의 방향(증가/감소)'은 알려주지 않으므로 방향은 2페이지의 조건별 변화 그래프로 확인합니다.")
-
+            "- 중요도는 트리가 값을 나눌 때 그 변수를 얼마나 유용하게 썼는지의 합이며, 전체 합은 100%입니다.\n"
+            "- 영향의 **방향**(증가/감소)은 알려주지 않으므로 2페이지의 조건별 변화 그래프로 확인합니다.\n"
+            "- 이 방식은 값 종류가 많은 변수에 유리하게 나오는 경향이 있고, Type은 원-핫 열을 합산한 값입니다.")
     # (4) 최종 결론문
     r2_gap = r2_cv - r2_ty
     st.markdown("### 📝 최종 결론")
